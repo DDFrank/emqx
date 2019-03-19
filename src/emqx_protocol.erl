@@ -29,10 +29,10 @@
 -export([parser/1]).
 -export([session/1]).
 -export([received/2]).
--export([process_packet/2]).
+-export([process/2]).
 -export([deliver/2]).
 -export([send/2]).
--export([shutdown/2]).
+-export([terminate/2]).
 
 -export_type([state/0]).
 
@@ -53,9 +53,10 @@
           clean_start,
           topic_aliases,
           packet_size,
+          will_topic,
+          will_msg,
           keepalive,
           mountpoint,
-          is_super,
           is_bridge,
           enable_ban,
           enable_acl,
@@ -65,7 +66,9 @@
           connected,
           connected_at,
           ignore_loop,
-          topic_alias_maximum
+          topic_alias_maximum,
+          conn_mod,
+          credentials
         }).
 
 -opaque(state() :: #pstate{}).
@@ -82,7 +85,7 @@
 %%------------------------------------------------------------------------------
 
 -spec(init(map(), list()) -> state()).
-init(#{peername := Peername, peercert := Peercert, sendfun := SendFun}, Options) ->
+init(SocketOpts = #{peername := Peername, peercert := Peercert, sendfun := SendFun}, Options)  ->
     Zone = proplists:get_value(zone, Options),
     #pstate{zone                = Zone,
             sendfun             = SendFun,
@@ -94,7 +97,6 @@ init(#{peername := Peername, peercert := Peercert, sendfun := SendFun}, Options)
             is_assigned         = false,
             conn_pid            = self(),
             username            = init_username(Peercert, Options),
-            is_super            = false,
             clean_start         = false,
             topic_aliases       = #{},
             packet_size         = emqx_zone:get_env(Zone, max_packet_size),
@@ -107,7 +109,9 @@ init(#{peername := Peername, peercert := Peercert, sendfun := SendFun}, Options)
             send_stats          = #{msg => 0, pkt => 0},
             connected           = false,
             ignore_loop         = emqx_config:get_env(mqtt_ignore_loop_deliver, false),
-            topic_alias_maximum = #{to_client => 0, from_client => 0}}.
+            topic_alias_maximum = #{to_client => 0, from_client => 0},
+            conn_mod            = maps:get(conn_mod, SocketOpts, undefined),
+            credentials         = #{}}.
 
 init_username(Peercert, Options) ->
     case proplists:get_value(peer_cert_as_username, Options) of
@@ -130,11 +134,13 @@ info(PState = #pstate{conn_props    = ConnProps,
                       ack_props     = AckProps,
                       session       = Session,
                       topic_aliases = Aliases,
+                      will_msg      = WillMsg,
                       enable_acl    = EnableAcl}) ->
     attrs(PState) ++ [{conn_props, ConnProps},
                       {ack_props, AckProps},
                       {session, Session},
                       {topic_aliases, Aliases},
+                      {will_msg, WillMsg},
                       {enable_acl, EnableAcl}].
 
 attrs(#pstate{zone         = Zone,
@@ -147,9 +153,10 @@ attrs(#pstate{zone         = Zone,
               proto_name   = ProtoName,
               keepalive    = Keepalive,
               mountpoint   = Mountpoint,
-              is_super     = IsSuper,
               is_bridge    = IsBridge,
-              connected_at = ConnectedAt}) ->
+              connected_at = ConnectedAt,
+              conn_mod     = ConnMod,
+              credentials  = Credentials}) ->
     [{zone, Zone},
      {client_id, ClientId},
      {username, Username},
@@ -160,9 +167,11 @@ attrs(#pstate{zone         = Zone,
      {clean_start, CleanStart},
      {keepalive, Keepalive},
      {mountpoint, Mountpoint},
-     {is_super, IsSuper},
      {is_bridge, IsBridge},
-     {connected_at, ConnectedAt}].
+     {connected_at, ConnectedAt},
+     {conn_mod, ConnMod},
+     {credentials, Credentials}
+     ].
 
 attr(max_inflight, #pstate{proto_ver = ?MQTT_PROTO_V5, conn_props = ConnProps}) ->
     get_property('Receive-Maximum', ConnProps, 65535);
@@ -192,6 +201,8 @@ caps(#pstate{zone = Zone}) ->
 client_id(#pstate{client_id = ClientId}) ->
     ClientId.
 
+credentials(#pstate{credentials = Credentials}) when map_size(Credentials) =/= 0 ->
+    Credentials;
 credentials(#pstate{zone       = Zone,
                     client_id  = ClientId,
                     username   = Username,
@@ -218,15 +229,16 @@ parser(#pstate{packet_size = Size, proto_ver = Ver}) ->
 %% Packet Received
 %%------------------------------------------------------------------------------
 
-set_protover(?CONNECT_PACKET(#mqtt_packet_connect{
-                                proto_ver = ProtoVer}),
-             PState) ->
-    PState#pstate{ proto_ver = ProtoVer };
+set_protover(?CONNECT_PACKET(#mqtt_packet_connect{proto_ver = ProtoVer}), PState) ->
+    PState#pstate{proto_ver = ProtoVer};
 set_protover(_Packet, PState) ->
     PState.
 
--spec(received(emqx_mqtt_types:packet(), state()) ->
-    {ok, state()} | {error, term()} | {error, term(), state()} | {stop, term(), state()}).
+-spec(received(emqx_mqtt_types:packet(), state())
+      -> {ok, state()}
+       | {error, term()}
+       | {error, term(), state()}
+       | {stop, term(), state()}).
 received(?PACKET(Type), PState = #pstate{connected = false}) when Type =/= ?CONNECT ->
     {error, proto_not_connected, PState};
 
@@ -234,33 +246,33 @@ received(?PACKET(?CONNECT), PState = #pstate{connected = true}) ->
     {error, proto_unexpected_connect, PState};
 
 received(Packet = ?PACKET(Type), PState) ->
-    PState1 = set_protover(Packet, PState),
     trace(recv, Packet),
+    PState1 = set_protover(Packet, PState),
     try emqx_packet:validate(Packet) of
         true ->
             case preprocess_properties(Packet, PState1) of
+                {ok, Packet1, PState2} ->
+                    process(Packet1, inc_stats(recv, Type, PState2));
                 {error, ReasonCode} ->
-                    {error, ReasonCode, PState1};
-                {Packet1, PState2} ->
-                    process_packet(Packet1, inc_stats(recv, Type, PState2))
+                    {error, ReasonCode, PState1}
             end
     catch
-        error : protocol_error ->
+        error:protocol_error ->
             deliver({disconnect, ?RC_PROTOCOL_ERROR}, PState1),
             {error, protocol_error, PState};
-        error : subscription_identifier_invalid ->
+        error:subscription_identifier_invalid ->
             deliver({disconnect, ?RC_SUBSCRIPTION_IDENTIFIERS_NOT_SUPPORTED}, PState1),
             {error, subscription_identifier_invalid, PState1};
-        error : topic_alias_invalid ->
+        error:topic_alias_invalid ->
             deliver({disconnect, ?RC_TOPIC_ALIAS_INVALID}, PState1),
             {error, topic_alias_invalid, PState1};
-        error : topic_filters_invalid ->
+        error:topic_filters_invalid ->
             deliver({disconnect, ?RC_TOPIC_FILTER_INVALID}, PState1),
             {error, topic_filters_invalid, PState1};
-        error : topic_name_invalid ->
+        error:topic_name_invalid ->
             deliver({disconnect, ?RC_TOPIC_FILTER_INVALID}, PState1),
             {error, topic_filters_invalid, PState1};
-        error : Reason ->
+        error:Reason ->
             deliver({disconnect, ?RC_MALFORMED_PACKET}, PState1),
             {error, Reason, PState1}
     end.
@@ -268,13 +280,14 @@ received(Packet = ?PACKET(Type), PState) ->
 %%------------------------------------------------------------------------------
 %% Preprocess MQTT Properties
 %%------------------------------------------------------------------------------
+
 preprocess_properties(Packet = #mqtt_packet{
                                    variable = #mqtt_packet_connect{
                                                   properties = #{'Topic-Alias-Maximum' := ToClient}
                                               }
                                },
                       PState = #pstate{topic_alias_maximum = TopicAliasMaximum}) ->
-    {Packet, PState#pstate{topic_alias_maximum = TopicAliasMaximum#{to_client => ToClient}}};
+    {ok, Packet, PState#pstate{topic_alias_maximum = TopicAliasMaximum#{to_client => ToClient}}};
 
 %% Subscription Identifier
 preprocess_properties(Packet = #mqtt_packet{
@@ -285,7 +298,7 @@ preprocess_properties(Packet = #mqtt_packet{
                                  },
                       PState = #pstate{proto_ver = ?MQTT_PROTO_V5}) ->
     TopicFilters1 = [{Topic, SubOpts#{subid => SubId}} || {Topic, SubOpts} <- TopicFilters],
-    {Packet#mqtt_packet{variable = Subscribe#mqtt_packet_subscribe{topic_filters = TopicFilters1}}, PState};
+    {ok, Packet#mqtt_packet{variable = Subscribe#mqtt_packet_subscribe{topic_filters = TopicFilters1}}, PState};
 
 %% Topic Alias Mapping
 preprocess_properties(#mqtt_packet{
@@ -306,8 +319,8 @@ preprocess_properties(Packet = #mqtt_packet{
                                        topic_alias_maximum = #{from_client := TopicAliasMaximum}}) ->
     case AliasId =< TopicAliasMaximum of
         true ->
-            {Packet#mqtt_packet{variable = Publish#mqtt_packet_publish{
-                                               topic_name = maps:get(AliasId, Aliases, <<>>)}}, PState};
+            {ok, Packet#mqtt_packet{variable = Publish#mqtt_packet_publish{
+                                                 topic_name = maps:get(AliasId, Aliases, <<>>)}}, PState};
         false ->
             deliver({disconnect, ?RC_TOPIC_ALIAS_INVALID}, PState),
             {error, ?RC_TOPIC_ALIAS_INVALID}
@@ -323,28 +336,28 @@ preprocess_properties(Packet = #mqtt_packet{
                                        topic_alias_maximum = #{from_client := TopicAliasMaximum}}) ->
     case AliasId =< TopicAliasMaximum of
         true ->
-            {Packet, PState#pstate{topic_aliases = maps:put(AliasId, Topic, Aliases)}};
+            {ok, Packet, PState#pstate{topic_aliases = maps:put(AliasId, Topic, Aliases)}};
         false ->
             deliver({disconnect, ?RC_TOPIC_ALIAS_INVALID}, PState),
             {error, ?RC_TOPIC_ALIAS_INVALID}
     end;
 
 preprocess_properties(Packet, PState) ->
-    {Packet, PState}.
+    {ok, Packet, PState}.
 
 %%------------------------------------------------------------------------------
 %% Process MQTT Packet
 %%------------------------------------------------------------------------------
-process_packet(?CONNECT_PACKET(
-                  #mqtt_packet_connect{proto_name  = ProtoName,
-                                       proto_ver   = ProtoVer,
-                                       is_bridge   = IsBridge,
-                                       clean_start = CleanStart,
-                                       keepalive   = Keepalive,
-                                       properties  = ConnProps,
-                                       client_id   = ClientId,
-                                       username    = Username,
-                                       password    = Password} = ConnPkt), PState) ->
+process(?CONNECT_PACKET(
+           #mqtt_packet_connect{proto_name  = ProtoName,
+                                proto_ver   = ProtoVer,
+                                is_bridge   = IsBridge,
+                                clean_start = CleanStart,
+                                keepalive   = Keepalive,
+                                properties  = ConnProps,
+                                client_id   = ClientId,
+                                username    = Username,
+                                password    = Password} = ConnPkt), PState) ->
 
     NewClientId = maybe_use_username_as_clientid(ClientId, Username, PState),
 
@@ -352,8 +365,7 @@ process_packet(?CONNECT_PACKET(
 
     %% TODO: Mountpoint...
     %% Msg -> emqx_mountpoint:mount(MountPoint, Msg)
-
-    PState1 = set_username(Username,
+    PState0 = set_username(Username,
                            PState#pstate{client_id    = NewClientId,
                                          proto_ver    = ProtoVer,
                                          proto_name   = ProtoName,
@@ -362,20 +374,21 @@ process_packet(?CONNECT_PACKET(
                                          conn_props   = ConnProps,
                                          is_bridge    = IsBridge,
                                          connected_at = os:timestamp()}),
-
+    Credentials = credentials(PState0),
+    PState1 = PState0#pstate{credentials = Credentials},
     connack(
       case check_connect(ConnPkt, PState1) of
-          {ok, PState2} ->
-              case authenticate(credentials(PState2), Password) of
-                  {ok, IsSuper} ->
-                      %% Maybe assign a clientId
-                      PState3 = maybe_assign_client_id(PState2#pstate{is_super = IsSuper}),
+          ok ->
+              case emqx_access_control:authenticate(Credentials#{password => Password}) of
+                  {ok, Credentials0} ->
+                      PState3 = maybe_assign_client_id(PState1),
                       emqx_logger:set_metadata_client_id(PState3#pstate.client_id),
                       %% Open session
                       SessAttrs = #{will_msg => make_will_msg(ConnPkt)},
                       case try_open_session(SessAttrs, PState3) of
                           {ok, SPid, SP} ->
-                              PState4 = PState3#pstate{session = SPid, connected = true},
+                              PState4 = PState3#pstate{session = SPid, connected = true,
+                                                       credentials = maps:remove(password, Credentials0)},
                               ok = emqx_cm:register_connection(client_id(PState4)),
                               true = emqx_cm:set_conn_attrs(client_id(PState4), attrs(PState4)),
                               %% Start keepalive
@@ -384,60 +397,58 @@ process_packet(?CONNECT_PACKET(
                               {?RC_SUCCESS, SP, PState4};
                           {error, Error} ->
                               ?LOG(error, "Failed to open session: ~p", [Error]),
-                              {?RC_UNSPECIFIED_ERROR, PState1}
+                              {?RC_UNSPECIFIED_ERROR, PState1#pstate{credentials = Credentials0}}
                       end;
                   {error, Reason} ->
-                      ?LOG(error, "Username '~s' login failed for ~p", [Username, Reason]),
-                      {?RC_NOT_AUTHORIZED, PState1}
+                      ?LOG(error, "Client ~s (Username: '~s') login failed for ~p", [NewClientId, Username, Reason]),
+                      {emqx_reason_codes:connack_error(Reason), PState1#pstate{credentials = Credentials}}
               end;
           {error, ReasonCode} ->
               {ReasonCode, PState1}
       end);
 
-process_packet(Packet = ?PUBLISH_PACKET(?QOS_0, Topic, _PacketId, _Payload), PState) ->
+process(Packet = ?PUBLISH_PACKET(?QOS_0, Topic, _PacketId, _Payload), PState) ->
     case check_publish(Packet, PState) of
-        {ok, PState1} ->
-            do_publish(Packet, PState1);
+        ok ->
+            do_publish(Packet, PState);
         {error, ReasonCode} ->
             ?LOG(warning, "Cannot publish qos0 message to ~s for ~s",
-                [Topic, emqx_reason_codes:text(ReasonCode)]),
+                 [Topic, emqx_reason_codes:text(ReasonCode)]),
             do_acl_deny_action(Packet, ReasonCode, PState)
     end;
 
-process_packet(Packet = ?PUBLISH_PACKET(?QOS_1, Topic, PacketId, _Payload), PState) ->
+process(Packet = ?PUBLISH_PACKET(?QOS_1, Topic, PacketId, _Payload), PState) ->
     case check_publish(Packet, PState) of
-        {ok, PState1} ->
-            do_publish(Packet, PState1);
+        ok ->
+            do_publish(Packet, PState);
         {error, ReasonCode} ->
             ?LOG(warning, "Cannot publish qos1 message to ~s for ~s",
                 [Topic, emqx_reason_codes:text(ReasonCode)]),
             case deliver({puback, PacketId, ReasonCode}, PState) of
                 {ok, PState1} ->
                     do_acl_deny_action(Packet, ReasonCode, PState1);
-                Error ->
-                    Error
+                Error -> Error
             end
     end;
 
-process_packet(Packet = ?PUBLISH_PACKET(?QOS_2, Topic, PacketId, _Payload), PState) ->
+process(Packet = ?PUBLISH_PACKET(?QOS_2, Topic, PacketId, _Payload), PState) ->
     case check_publish(Packet, PState) of
-        {ok, PState1} ->
-            do_publish(Packet, PState1);
+        ok ->
+            do_publish(Packet, PState);
         {error, ReasonCode} ->
             ?LOG(warning, "Cannot publish qos2 message to ~s for ~s",
-                [Topic, emqx_reason_codes:text(ReasonCode)]),
+                 [Topic, emqx_reason_codes:text(ReasonCode)]),
             case deliver({pubrec, PacketId, ReasonCode}, PState) of
                 {ok, PState1} ->
                     do_acl_deny_action(Packet, ReasonCode, PState1);
-                Error ->
-                    Error
+                Error -> Error
             end
     end;
 
-process_packet(?PUBACK_PACKET(PacketId, ReasonCode), PState = #pstate{session = SPid}) ->
+process(?PUBACK_PACKET(PacketId, ReasonCode), PState = #pstate{session = SPid}) ->
     {ok = emqx_session:puback(SPid, PacketId, ReasonCode), PState};
 
-process_packet(?PUBREC_PACKET(PacketId, ReasonCode), PState = #pstate{session = SPid}) ->
+process(?PUBREC_PACKET(PacketId, ReasonCode), PState = #pstate{session = SPid}) ->
     case emqx_session:pubrec(SPid, PacketId, ReasonCode) of
         ok ->
             send(?PUBREL_PACKET(PacketId), PState);
@@ -445,7 +456,7 @@ process_packet(?PUBREC_PACKET(PacketId, ReasonCode), PState = #pstate{session = 
             send(?PUBREL_PACKET(PacketId, NotFound), PState)
     end;
 
-process_packet(?PUBREL_PACKET(PacketId, ReasonCode), PState = #pstate{session = SPid}) ->
+process(?PUBREL_PACKET(PacketId, ReasonCode), PState = #pstate{session = SPid}) ->
     case emqx_session:pubrel(SPid, PacketId, ReasonCode) of
         ok ->
             send(?PUBCOMP_PACKET(PacketId), PState);
@@ -453,45 +464,38 @@ process_packet(?PUBREL_PACKET(PacketId, ReasonCode), PState = #pstate{session = 
             send(?PUBCOMP_PACKET(PacketId, NotFound), PState)
     end;
 
-process_packet(?PUBCOMP_PACKET(PacketId, ReasonCode), PState = #pstate{session = SPid}) ->
+process(?PUBCOMP_PACKET(PacketId, ReasonCode), PState = #pstate{session = SPid}) ->
     {ok = emqx_session:pubcomp(SPid, PacketId, ReasonCode), PState};
 
-process_packet(Packet = ?SUBSCRIBE_PACKET(PacketId, Properties, RawTopicFilters),
-               PState = #pstate{session = SPid, mountpoint = Mountpoint,
-                                proto_ver = ProtoVer, is_bridge = IsBridge,
-                                ignore_loop = IgnoreLoop}) ->
-    RawTopicFilters1 =  if ProtoVer < ?MQTT_PROTO_V5 ->
-                            IfIgnoreLoop = case IgnoreLoop of true -> 1; false -> 0 end,
-                            case IsBridge of
-                                true -> [{RawTopic, SubOpts#{rap => 1, nl => IfIgnoreLoop}} || {RawTopic, SubOpts} <- RawTopicFilters];
-                                false -> [{RawTopic, SubOpts#{rap => 0, nl => IfIgnoreLoop}} || {RawTopic, SubOpts} <- RawTopicFilters]
-                            end;
-                           true ->
-                               RawTopicFilters
-                        end,
+process(Packet = ?SUBSCRIBE_PACKET(PacketId, Properties, RawTopicFilters),
+        PState = #pstate{session = SPid, mountpoint = Mountpoint,
+                         proto_ver = ProtoVer, is_bridge = IsBridge,
+                         ignore_loop = IgnoreLoop}) ->
+    RawTopicFilters1 = if ProtoVer < ?MQTT_PROTO_V5 ->
+                           IfIgnoreLoop = case IgnoreLoop of true -> 1; false -> 0 end,
+                           case IsBridge of
+                               true -> [{RawTopic, SubOpts#{rap => 1, nl => IfIgnoreLoop}} || {RawTopic, SubOpts} <- RawTopicFilters];
+                               false -> [{RawTopic, SubOpts#{rap => 0, nl => IfIgnoreLoop}} || {RawTopic, SubOpts} <- RawTopicFilters]
+                           end;
+                          true ->
+                              RawTopicFilters
+                       end,
     case check_subscribe(
            parse_topic_filters(?SUBSCRIBE, RawTopicFilters1), PState) of
         {ok, TopicFilters} ->
-            case emqx_hooks:run('client.subscribe', [credentials(PState)], TopicFilters) of
-                {ok, TopicFilters1} ->
-                    ok = emqx_session:subscribe(SPid, PacketId, Properties,
-                                                emqx_mountpoint:mount(Mountpoint, TopicFilters1)),
-                    {ok, PState};
-                {stop, _} ->
-                    ReasonCodes = lists:duplicate(length(TopicFilters),
-                                                  ?RC_IMPLEMENTATION_SPECIFIC_ERROR),
-                    deliver({suback, PacketId, ReasonCodes}, PState)
-            end;
+            TopicFilters0 = emqx_hooks:run_fold('client.subscribe', [credentials(PState)], TopicFilters),
+            ok = emqx_session:subscribe(SPid, PacketId, Properties,
+                                        emqx_mountpoint:mount(Mountpoint, TopicFilters0)),
+            {ok, PState};
         {error, TopicFilters} ->
-            {ReverseSubTopics, ReverseReasonCodes} =
-                lists:foldl(fun({Topic, #{rc := ?RC_SUCCESS}}, {Topics, Codes}) ->
+            {SubTopics, ReasonCodes} =
+                lists:foldr(fun({Topic, #{rc := ?RC_SUCCESS}}, {Topics, Codes}) ->
                                     {[Topic|Topics], [?RC_IMPLEMENTATION_SPECIFIC_ERROR | Codes]};
                                 ({Topic, #{rc := Code}}, {Topics, Codes}) ->
                                     {[Topic|Topics], [Code|Codes]}
                             end, {[], []}, TopicFilters),
-            {SubTopics, ReasonCodes} = {lists:reverse(ReverseSubTopics), lists:reverse(ReverseReasonCodes)},
             ?LOG(warning, "Cannot subscribe ~p for ~p",
-                [SubTopics, [emqx_reason_codes:text(R) || R <- ReasonCodes]]),
+                 [SubTopics, [emqx_reason_codes:text(R) || R <- ReasonCodes]]),
             case deliver({suback, PacketId, ReasonCodes}, PState) of
                 {ok, PState1} ->
                     do_acl_deny_action(Packet, ReasonCodes, PState1);
@@ -500,36 +504,33 @@ process_packet(Packet = ?SUBSCRIBE_PACKET(PacketId, Properties, RawTopicFilters)
             end
     end;
 
-process_packet(?UNSUBSCRIBE_PACKET(PacketId, Properties, RawTopicFilters),
-               PState = #pstate{session = SPid, mountpoint = MountPoint}) ->
-    case emqx_hooks:run('client.unsubscribe', [credentials(PState)],
-                        parse_topic_filters(?UNSUBSCRIBE, RawTopicFilters)) of
-        {ok, TopicFilters} ->
-            ok = emqx_session:unsubscribe(SPid, PacketId, Properties,
-                                          emqx_mountpoint:mount(MountPoint, TopicFilters)),
-            {ok, PState};
-        {stop, _Acc} ->
-            ReasonCodes = lists:duplicate(length(RawTopicFilters),
-                                          ?RC_IMPLEMENTATION_SPECIFIC_ERROR),
-            deliver({unsuback, PacketId, ReasonCodes}, PState)
-    end;
+process(?UNSUBSCRIBE_PACKET(PacketId, Properties, RawTopicFilters),
+        PState = #pstate{session = SPid, mountpoint = MountPoint}) ->
+    TopicFilters = emqx_hooks:run_fold('client.unsubscribe', [credentials(PState)],
+                                       parse_topic_filters(?UNSUBSCRIBE, RawTopicFilters)),
+    ok = emqx_session:unsubscribe(SPid, PacketId, Properties,
+                                  emqx_mountpoint:mount(MountPoint, TopicFilters)),
+    {ok, PState};
 
-process_packet(?PACKET(?PINGREQ), PState) ->
+process(?PACKET(?PINGREQ), PState) ->
     send(?PACKET(?PINGRESP), PState);
 
-process_packet(?DISCONNECT_PACKET(?RC_SUCCESS, #{'Session-Expiry-Interval' := Interval}),
-                PState = #pstate{session = SPid, conn_props = #{'Session-Expiry-Interval' := OldInterval}}) ->
+process(?DISCONNECT_PACKET(?RC_SUCCESS, #{'Session-Expiry-Interval' := Interval}),
+        PState = #pstate{session = SPid, conn_props = #{'Session-Expiry-Interval' := OldInterval}}) ->
     case Interval =/= 0 andalso OldInterval =:= 0 of
         true ->
             deliver({disconnect, ?RC_PROTOCOL_ERROR}, PState),
-            {error, protocol_error, PState};
+            {error, protocol_error, PState#pstate{will_msg = undefined}};
         false ->
             emqx_session:update_expiry_interval(SPid, Interval),
-            {stop, normal, PState}
+            %% Clean willmsg
+            {stop, normal, PState#pstate{will_msg = undefined}}
     end;
-process_packet(?DISCONNECT_PACKET(?RC_SUCCESS), PState) ->
-    {stop, normal, PState};
-process_packet(?DISCONNECT_PACKET(_), PState) ->
+
+process(?DISCONNECT_PACKET(?RC_SUCCESS), PState) ->
+    {stop, normal, PState#pstate{will_msg = undefined}};
+
+process(?DISCONNECT_PACKET(_), PState) ->
     {stop, {shutdown, abnormal_disconnet}, PState}.
 
 %%------------------------------------------------------------------------------
@@ -537,11 +538,11 @@ process_packet(?DISCONNECT_PACKET(_), PState) ->
 %%------------------------------------------------------------------------------
 
 connack({?RC_SUCCESS, SP, PState}) ->
-    emqx_hooks:run('client.connected', [credentials(PState), ?RC_SUCCESS, attrs(PState)]),
+    ok = emqx_hooks:run('client.connected', [credentials(PState), ?RC_SUCCESS, attrs(PState)]),
     deliver({connack, ?RC_SUCCESS, sp(SP)}, update_mountpoint(PState));
 
 connack({ReasonCode, PState = #pstate{proto_ver = ProtoVer}}) ->
-    emqx_hooks:run('client.connected', [credentials(PState), ReasonCode, attrs(PState)]),
+    ok = emqx_hooks:run('client.connected', [credentials(PState), ReasonCode, attrs(PState)]),
     [ReasonCode1] = reason_codes_compat(connack, [ReasonCode], ProtoVer),
     _ = deliver({connack, ReasonCode1}, PState),
     {error, emqx_reason_codes:name(ReasonCode1, ProtoVer), PState}.
@@ -562,15 +563,16 @@ do_publish(Packet = ?PUBLISH_PACKET(QoS, PacketId),
 
 puback(?QOS_0, _PacketId, _Result, PState) ->
     {ok, PState};
-puback(?QOS_1, PacketId, [], PState) ->
+puback(?QOS_1, PacketId, {ok, []}, PState) ->
     deliver({puback, PacketId, ?RC_NO_MATCHING_SUBSCRIBERS}, PState);
-puback(?QOS_1, PacketId, [_|_], PState) -> %%TODO: check the dispatch?
+%%TODO: calc the deliver count?
+puback(?QOS_1, PacketId, {ok, _Result}, PState) ->
     deliver({puback, PacketId, ?RC_SUCCESS}, PState);
 puback(?QOS_1, PacketId, {error, ReasonCode}, PState) ->
     deliver({puback, PacketId, ReasonCode}, PState);
-puback(?QOS_2, PacketId, [], PState) ->
+puback(?QOS_2, PacketId, {ok, []}, PState) ->
     deliver({pubrec, PacketId, ?RC_NO_MATCHING_SUBSCRIBERS}, PState);
-puback(?QOS_2, PacketId, [_|_], PState) -> %%TODO: check the dispatch?
+puback(?QOS_2, PacketId, {ok, _Result}, PState) ->
     deliver({pubrec, PacketId, ?RC_SUCCESS}, PState);
 puback(?QOS_2, PacketId, {error, ReasonCode}, PState) ->
     deliver({pubrec, PacketId, ReasonCode}, PState).
@@ -579,34 +581,48 @@ puback(?QOS_2, PacketId, {error, ReasonCode}, PState) ->
 %% Deliver Packet -> Client
 %%------------------------------------------------------------------------------
 
--spec(deliver(tuple(), state()) -> {ok, state()} | {error, term()}).
+-spec(deliver(list(tuple()) | tuple(), state()) -> {ok, state()} | {error, term()}).
+deliver([], PState) ->
+    {ok, PState};
+deliver([Pub|More], PState) ->
+    case deliver(Pub, PState) of
+        {ok, PState1} ->
+            deliver(More, PState1);
+        {error, _} = Error ->
+            Error
+    end;
+
 deliver({connack, ReasonCode}, PState) ->
     send(?CONNACK_PACKET(ReasonCode), PState);
 
 deliver({connack, ?RC_SUCCESS, SP}, PState = #pstate{zone = Zone,
                                                      proto_ver = ?MQTT_PROTO_V5,
                                                      client_id = ClientId,
-                                                     conn_props = ConnProps,
                                                      is_assigned = IsAssigned,
                                                      topic_alias_maximum = TopicAliasMaximum}) ->
-    ResponseInformation = case maps:find('Request-Response-Information', ConnProps) of
-                              {ok, 1} ->
-                                  iolist_to_binary(emqx_config:get_env(response_topic_prefix));
-                              _ ->
-                                  <<>>
-                          end,
     #{max_packet_size := MaxPktSize,
       max_qos_allowed := MaxQoS,
       mqtt_retain_available := Retain,
       max_topic_alias := MaxAlias,
       mqtt_shared_subscription := Shared,
       mqtt_wildcard_subscription := Wildcard} = caps(PState),
+    %% Response-Information is so far not set by broker.
+    %% i.e. It's a Client-to-Client contract for the request-response topic naming scheme.
+    %% According to MQTT 5.0 spec:
+    %%   A common use of this is to pass a globally unique portion of the topic tree which
+    %%   is reserved for this Client for at least the lifetime of its Session.
+    %%   This often cannot just be a random name as both the requesting Client and the
+    %%   responding Client need to be authorized to use it.
+    %% If we are to support it in the feature, the implementation should be flexible
+    %% to allow prefixing the response topic based on different ACL config.
+    %% e.g. prefix by username or client-id, so that unauthorized clients can not
+    %% subscribe requests or responses that are not intended for them.
     Props = #{'Retain-Available' => flag(Retain),
               'Maximum-Packet-Size' => MaxPktSize,
               'Topic-Alias-Maximum' => MaxAlias,
               'Wildcard-Subscription-Available' => flag(Wildcard),
               'Subscription-Identifier-Available' => 1,
-              'Response-Information' => ResponseInformation,
+              %'Response-Information' =>
               'Shared-Subscription-Available' => flag(Shared)},
 
     Props1 = if
@@ -635,7 +651,8 @@ deliver({connack, ReasonCode, SP}, PState) ->
     send(?CONNACK_PACKET(ReasonCode, SP), PState);
 
 deliver({publish, PacketId, Msg}, PState = #pstate{mountpoint = MountPoint}) ->
-    ok = emqx_hooks:run('message.delivered', [credentials(PState)], Msg),
+
+    ok = emqx_hooks:run_fold('message.deliver', [credentials(PState)], Msg),
     Msg0 = emqx_message:remove_header('Topic-Alias', Msg),
     Msg1 = emqx_message:update_expiry(Msg0),
     Msg2 = emqx_mountpoint:unmount(MountPoint, Msg1),
@@ -667,11 +684,12 @@ deliver({disconnect, _ReasonCode}, PState) ->
 %% Send Packet to Client
 
 -spec(send(emqx_mqtt_types:packet(), state()) -> {ok, state()} | {error, term()}).
-send(Packet = ?PACKET(Type), PState = #pstate{proto_ver = Ver, sendfun = SendFun}) ->
-    trace(send, Packet),
-    case SendFun(Packet, #{version => Ver}) of
-        ok ->
+send(Packet = ?PACKET(Type), PState = #pstate{proto_ver = Ver, sendfun = Send}) ->
+    case Send(Packet, #{version => Ver}) of
+        {ok, Data} ->
+            trace(send, Packet),
             emqx_metrics:sent(Packet),
+            emqx_metrics:trans(inc, 'bytes/sent', iolist_size(Data)),
             {ok, inc_stats(send, Type, PState)};
         {error, Reason} ->
             {error, Reason}
@@ -716,17 +734,6 @@ try_open_session(SessAttrs, PState = #pstate{zone = Zone,
         {ok, SPid} ->
             {ok, SPid, false};
         Other -> Other
-    end.
-
-authenticate(Credentials, Password) ->
-    case emqx_access_control:authenticate(Credentials, Password) of
-        ok -> {ok, false};
-        {ok, IsSuper} when is_boolean(IsSuper) ->
-            {ok, IsSuper};
-        {ok, Result} when is_map(Result) ->
-            {ok, maps:get(is_superuser, Result, false)};
-        {error, Error} ->
-            {error, Error}
     end.
 
 set_property(Name, Value, ?NO_PROPS) ->
@@ -810,14 +817,13 @@ check_will_topic(#mqtt_packet_connect{will_topic = WillTopic} = ConnPkt, PState)
             {error, ?RC_TOPIC_NAME_INVALID}
     end.
 
-check_will_acl(_ConnPkt, #pstate{enable_acl = EnableAcl})
-  when not EnableAcl ->
+check_will_acl(_ConnPkt, #pstate{enable_acl = EnableAcl}) when not EnableAcl ->
     ok;
 check_will_acl(#mqtt_packet_connect{will_topic = WillTopic}, PState) ->
     case emqx_access_control:check_acl(credentials(PState), publish, WillTopic) of
         allow -> ok;
         deny ->
-            ?LOG(warning, "Will message (to ~s) validation failed, acl denied", [WillTopic]),
+            ?LOG(warning, "Cannot publish will message to ~p for acl denied", [WillTopic]),
             {error, ?RC_NOT_AUTHORIZED}
     end.
 
@@ -826,29 +832,25 @@ check_publish(Packet, PState) ->
                      fun check_pub_acl/2], Packet, PState).
 
 check_pub_caps(#mqtt_packet{header = #mqtt_packet_header{qos = QoS, retain = Retain},
-                            variable = #mqtt_packet_publish{ properties = _Properties}},
+                            variable = #mqtt_packet_publish{properties = _Properties}},
                #pstate{zone = Zone}) ->
     emqx_mqtt_caps:check_pub(Zone, #{qos => QoS, retain => Retain}).
 
-check_pub_acl(_Packet, #pstate{is_super = IsSuper, enable_acl = EnableAcl})
-    when IsSuper orelse (not EnableAcl) ->
+check_pub_acl(_Packet, #pstate{credentials = #{is_superuser := IsSuper}, enable_acl = EnableAcl})
+        when IsSuper orelse (not EnableAcl) ->
     ok;
-
 check_pub_acl(#mqtt_packet{variable = #mqtt_packet_publish{topic_name = Topic}}, PState) ->
     case emqx_access_control:check_acl(credentials(PState), publish, Topic) of
         allow -> ok;
-        deny  ->
-            {error, ?RC_NOT_AUTHORIZED}
+        deny -> {error, ?RC_NOT_AUTHORIZED}
     end.
 
-run_check_steps([], _Packet, PState) ->
-    {ok, PState};
+run_check_steps([], _Packet, _PState) ->
+    ok;
 run_check_steps([Check|Steps], Packet, PState) ->
     case Check(Packet, PState) of
         ok ->
             run_check_steps(Steps, Packet, PState);
-        {ok, PState1} ->
-            run_check_steps(Steps, Packet, PState1);
         Error = {error, _RC} ->
             Error
     end.
@@ -861,15 +863,13 @@ check_subscribe(TopicFilters, PState = #pstate{zone = Zone}) ->
             {error, TopicFilter1}
     end.
 
-check_sub_acl(TopicFilters, #pstate{is_super = IsSuper, enable_acl = EnableAcl})
-    when IsSuper orelse (not EnableAcl) ->
+check_sub_acl(TopicFilters, #pstate{credentials = #{is_superuser := IsSuper}, enable_acl = EnableAcl})
+        when IsSuper orelse (not EnableAcl) ->
     {ok, TopicFilters};
-
 check_sub_acl(TopicFilters, PState) ->
-    Credentials = credentials(PState),
     lists:foldr(
       fun({Topic, SubOpts}, {Ok, Acc}) ->
-              case emqx_access_control:check_acl(Credentials, subscribe, Topic) of
+              case emqx_access_control:check_acl(credentials(PState), publish, Topic) of
                   allow -> {Ok, [{Topic, SubOpts}|Acc]};
                   deny  ->
                       {error, [{Topic, SubOpts#{rc := ?RC_NOT_AUTHORIZED}}|Acc]}
@@ -893,17 +893,17 @@ inc_stats(Type, Stats = #{pkt := PktCnt, msg := MsgCnt}) ->
                                          false -> MsgCnt
                                      end}.
 
-shutdown(_Reason, #pstate{client_id = undefined}) ->
+terminate(_Reason, #pstate{client_id = undefined}) ->
     ok;
-shutdown(_Reason, #pstate{connected = false}) ->
+terminate(_Reason, #pstate{connected = false}) ->
     ok;
-shutdown(conflict, _PState) ->
+terminate(conflict, _PState) ->
     ok;
-shutdown(discard, _PState) ->
+terminate(discard, _PState) ->
     ok;
-shutdown(Reason, PState) ->
+terminate(Reason, PState) ->
     ?LOG(info, "Shutdown for ~p", [Reason]),
-    emqx_hooks:run('client.disconnected', [credentials(PState), Reason]).
+    ok = emqx_hooks:run('client.disconnected', [credentials(PState), Reason]).
 
 start_keepalive(0, _PState) ->
     ignore;
@@ -975,4 +975,3 @@ reason_codes_compat(unsuback, _ReasonCodes, _ProtoVer) ->
     undefined;
 reason_codes_compat(PktType, ReasonCodes, _ProtoVer) ->
     [emqx_reason_codes:compat(PktType, RC) || RC <- ReasonCodes].
-

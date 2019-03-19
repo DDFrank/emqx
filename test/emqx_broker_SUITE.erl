@@ -29,8 +29,7 @@ all() ->
     [{group, pubsub},
      {group, session},
      {group, metrics},
-     {group, stats},
-     {group, alarms}].
+     {group, stats}].
 
 groups() ->
     [
@@ -41,8 +40,7 @@ groups() ->
                            'pubsub#', 'pubsub+']},
      {session, [sequence], [start_session]},
      {metrics, [sequence], [inc_dec_metric]},
-     {stats, [sequence], [set_get_stat]},
-     {alarms, [sequence], [set_alarms]}
+     {stats, [sequence], [set_get_stat]}
     ].
 
 init_per_suite(Config) ->
@@ -74,7 +72,7 @@ publish(_) ->
     ok = emqx:subscribe(<<"test/+">>),
     timer:sleep(10),
     emqx:publish(Msg),
-    ?assert(receive {dispatch, <<"test/+">>, Msg} -> true after 5 -> false end).
+    ?assert(receive {dispatch, <<"test/+">>, #message{payload = <<"hello">>}} -> true after 100 -> false end).
 
 dispatch_with_no_sub(_) ->
     Msg = emqx_message:make(ct, <<"no_subscribers">>, <<"hello">>),
@@ -100,7 +98,7 @@ pubsub(_) ->
                 true;
             P ->
                 ct:log("Receive Message: ~p~n",[P])
-        after 2 ->
+        after 100 ->
             false
         end),
     spawn(fun() ->
@@ -126,14 +124,14 @@ t_shared_subscribe(_) ->
     emqx:subscribe(<<"a/#">>),
     timer:sleep(10),
     emqx:publish(emqx_message:make(ct, <<"a/b/c">>, <<"hello">>)),
-    ?assert(receive {dispatch, <<"a/#">>, _} -> true after 2 -> false end),
+    ?assert(receive {dispatch, <<"a/#">>, _} -> true after 100 -> false end),
     emqx:unsubscribe(<<"a/#">>).
 
 'pubsub+'(_) ->
     emqx:subscribe(<<"a/+/+">>),
     timer:sleep(10),
     emqx:publish(emqx_message:make(ct, <<"a/b/c">>, <<"hello">>)),
-    ?assert(receive {dispatch, <<"a/+/+">>, _} -> true after 1 -> false end),
+    ?assert(receive {dispatch, <<"a/+/+">>, _} -> true after 100 -> false end),
     emqx:unsubscribe(<<"a/+/+">>).
 
 %%--------------------------------------------------------------------
@@ -171,12 +169,3 @@ inc_dec_metric(_) ->
 set_get_stat(_) ->
     emqx_stats:setstat('retained/max', 99),
     99 = emqx_stats:getstat('retained/max').
-
-set_alarms(_) ->
-    AlarmTest = #alarm{id = <<"1">>, severity = error, title="alarm title", summary="alarm summary"},
-    emqx_alarm_mgr:set_alarm(AlarmTest),
-    Alarms = emqx_alarm_mgr:get_alarms(),
-    ct:log("Alarms Length: ~p ~n", [length(Alarms)]),
-    ?assertEqual(1, length(Alarms)),
-    emqx_alarm_mgr:clear_alarm(<<"1">>),
-    [] = emqx_alarm_mgr:get_alarms().

@@ -1,4 +1,4 @@
-%% Copyright (c) 2013-2013-2019 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2013-2019 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%
 %% Licensed under the Apache License, Version 2.0 (the "License");
 %% you may not use this file except in compliance with the License.
@@ -21,11 +21,18 @@
 -define(RPC, gen_rpc).
 
 call(Node, Mod, Fun, Args) ->
-    ?RPC:call(Node, Mod, Fun, Args).
+    filter_result(?RPC:call(Node, Mod, Fun, Args)).
 
 multicall(Nodes, Mod, Fun, Args) ->
-    ?RPC:multicall(Nodes, Mod, Fun, Args).
+    filter_result(?RPC:multicall(Nodes, Mod, Fun, Args)).
 
 cast(Node, Mod, Fun, Args) ->
-    ?RPC:cast(Node, Mod, Fun, Args).
+    filter_result(?RPC:cast(Node, Mod, Fun, Args)).
+
+filter_result(Delivery) ->
+    case Delivery of 
+        {badrpc, Reason} -> {badrpc, Reason};
+        {badtcp, Reason} -> {badrpc, Reason};
+        _ -> Delivery
+    end.
 

@@ -61,12 +61,7 @@ init([]) ->
     RouterSup = supervisor_spec(emqx_router_sup),
     %% Broker Sup
     BrokerSup = supervisor_spec(emqx_broker_sup),
-    %% BridgeSup
-    LocalBridgeSup = supervisor_spec(emqx_local_bridge_sup_sup),
-
     BridgeSup = supervisor_spec(emqx_bridge_sup),
-    %% AccessControl
-    AccessControl = worker_spec(emqx_access_control),
     %% Session Manager
     SMSup = supervisor_spec(emqx_sm_sup),
     %% Connection Manager
@@ -77,9 +72,7 @@ init([]) ->
           [KernelSup,
            RouterSup,
            BrokerSup,
-           LocalBridgeSup,
            BridgeSup,
-           AccessControl,
            SMSup,
            CMSup,
            SysSup]}}.
@@ -92,4 +85,3 @@ worker_spec(M) ->
     {M, {M, start_link, []}, permanent, 30000, worker, [M]}.
 supervisor_spec(M) ->
     {M, {M, start_link, []}, permanent, infinity, supervisor, [M]}.
-
